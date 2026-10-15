@@ -5,13 +5,15 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from typing import Any, Callable
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urljoin
 from urllib.request import Request, urlopen
 
 
@@ -31,6 +33,9 @@ class Config:
     client_timespan_seconds: int = 86400
     max_wireless_clients: int = 100
     max_wireless_access_points: int = 100
+    max_retries: int = 3
+    retry_backoff_seconds: float = 1.0
+    max_pages: int = 100
 
 
 def load_dotenv_file(path: str = ".env") -> None:
@@ -68,6 +73,9 @@ def load_config(env: dict[str, str] | None = None) -> Config:
         client_timespan_seconds=int(env.get("MERAKI_CLIENT_TIMESPAN", "86400")),
         max_wireless_clients=int(env.get("MAX_WIRELESS_CLIENTS", "100")),
         max_wireless_access_points=int(env.get("MAX_WIRELESS_ACCESS_POINTS", "100")),
+        max_retries=max(0, int(env.get("HTTP_MAX_RETRIES", "3"))),
+        retry_backoff_seconds=max(0.0, float(env.get("HTTP_RETRY_BACKOFF_SECONDS", "1.0"))),
+        max_pages=max(1, int(env.get("MERAKI_MAX_PAGES", "100"))),
     )
 
 
@@ -110,29 +118,145 @@ def iso_to_ns(value: str | None) -> int | None:
         return None
 
 
-def http_json(url: str, headers: dict[str, str], timeout: int, query: dict[str, Any] | None = None) -> Any:
+def format_last_connected(epoch_seconds: int | float) -> str:
+    """Format Meraki lastSeen like the Dashboard Connected column, in UTC."""
+    connected = datetime.fromtimestamp(float(epoch_seconds), tz=timezone.utc)
+    hour = connected.hour % 12 or 12
+    return f"{connected:%m/%d/%Y} {hour}:{connected:%M:%S} {connected:%p} UTC"
+
+
+RETRYABLE_HTTP_STATUS = {408, 425, 429, 500, 502, 503, 504}
+NEXT_LINK_PATTERN = re.compile(r"<([^>]+)>\s*;\s*rel=\"?next\"?", re.IGNORECASE)
+
+
+def retry_after_seconds(value: str | None) -> float:
+    """Return a non-negative Retry-After delay for seconds or an HTTP date."""
+    if not value:
+        return 0.0
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        try:
+            retry_at = parsedate_to_datetime(value)
+            if retry_at.tzinfo is None:
+                retry_at = retry_at.replace(tzinfo=timezone.utc)
+            return max(0.0, (retry_at - datetime.now(timezone.utc)).total_seconds())
+        except (TypeError, ValueError, OverflowError):
+            return 0.0
+
+
+def retry_delay(attempt: int, backoff_seconds: float, headers: Any = None) -> float:
+    """Use the server's Retry-After value when present, otherwise exponential backoff."""
+    retry_after = headers.get("Retry-After") if headers is not None else None
+    return max(retry_after_seconds(retry_after), backoff_seconds * (2 ** attempt))
+
+
+def http_json_page(
+    url: str,
+    headers: dict[str, str],
+    timeout: int,
+    query: dict[str, Any] | None = None,
+    *,
+    opener: Callable[..., Any] | None = None,
+    sleeper: Callable[[float], None] | None = None,
+    max_retries: int = 3,
+    backoff_seconds: float = 1.0,
+) -> tuple[Any, Any]:
+    """GET one JSON page with bounded retries and return payload plus response headers."""
     if query:
         url += ("&" if "?" in url else "?") + urlencode(query)
+    opener = opener or urlopen
+    sleeper = sleeper or time.sleep
     request = Request(url, headers=headers, method="GET")
-    try:
-        with urlopen(request, timeout=timeout) as response:
-            return json.loads(response.read().decode("utf-8"))
-    except HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")
-        raise CollectorError(f"HTTP {exc.code} from {url}: {body[:300]}") from exc
-    except URLError as exc:
-        raise CollectorError(f"Unable to reach {url}: {exc.reason}") from exc
+
+    for attempt in range(max_retries + 1):
+        try:
+            with opener(request, timeout=timeout) as response:
+                return json.loads(response.read().decode("utf-8")), response.headers
+        except HTTPError as exc:
+            if exc.code in RETRYABLE_HTTP_STATUS and attempt < max_retries:
+                sleeper(retry_delay(attempt, backoff_seconds, exc.headers))
+                continue
+            body = exc.read().decode("utf-8", errors="replace")
+            raise CollectorError(f"HTTP {exc.code} from {url}: {body[:300]}") from exc
+        except URLError as exc:
+            if attempt < max_retries:
+                sleeper(backoff_seconds * (2 ** attempt))
+                continue
+            raise CollectorError(f"Unable to reach {url}: {exc.reason}") from exc
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise CollectorError(f"Invalid JSON response from {url}: {exc}") from exc
+
+    raise CollectorError(f"Request retries exhausted for {url}")
 
 
-def fetch_meraki(config: Config, path: str, query: dict[str, Any] | None = None, getter: Callable[..., Any] = http_json) -> Any:
+def http_json(url: str, headers: dict[str, str], timeout: int, query: dict[str, Any] | None = None) -> Any:
+    """Backward-compatible single-page JSON helper."""
+    payload, _ = http_json_page(url, headers, timeout, query)
+    return payload
+
+
+def next_link(headers: Any) -> str | None:
+    """Extract the RFC 5988/8288 next URL from a Meraki Link response header."""
+    link_header = headers.get("Link", "") if headers is not None else ""
+    for match in NEXT_LINK_PATTERN.finditer(link_header):
+        return match.group(1)
+    return None
+
+
+def merge_pages(current: Any, page: Any) -> Any:
+    """Merge list pages or item-list dictionaries while preserving response shape."""
+    if isinstance(current, list) and isinstance(page, list):
+        current.extend(page)
+        return current
+    if isinstance(current, dict) and isinstance(page, dict):
+        if isinstance(current.get("items"), list) and isinstance(page.get("items"), list):
+            current["items"].extend(page["items"])
+            return current
+    raise CollectorError("Meraki pagination returned incompatible response shapes")
+
+
+def fetch_meraki(
+    config: Config,
+    path: str,
+    query: dict[str, Any] | None = None,
+    getter: Callable[..., Any] | None = None,
+    *,
+    opener: Callable[..., Any] | None = None,
+    sleeper: Callable[[float], None] | None = None,
+) -> Any:
     if not config.meraki_api_key or not config.org_id:
         raise CollectorError("MERAKI_API_KEY and MERAKI_ORG_ID are required in real mode; create .env from .env.example")
-    return getter(
-        f"{config.meraki_base_url}{path}",
-        {"X-Cisco-Meraki-API-Key": config.meraki_api_key, "Accept": "application/json"},
-        config.timeout_seconds,
-        query,
-    )
+    headers = {"X-Cisco-Meraki-API-Key": config.meraki_api_key, "Accept": "application/json"}
+    base_url = f"{config.meraki_base_url}{path}"
+
+    # Preserve a simple injectable getter for unit tests and callers that already
+    # provide decoded payloads. Normal collection uses the paginated request path.
+    if getter is not None:
+        return getter(base_url, headers, config.timeout_seconds, query)
+
+    page_url = base_url
+    page_query = query
+    combined = None
+    for page_number in range(config.max_pages):
+        payload, response_headers = http_json_page(
+            page_url,
+            headers,
+            config.timeout_seconds,
+            page_query,
+            opener=opener,
+            sleeper=sleeper,
+            max_retries=config.max_retries,
+            backoff_seconds=config.retry_backoff_seconds,
+        )
+        combined = payload if combined is None else merge_pages(combined, payload)
+        link = next_link(response_headers)
+        if not link:
+            return combined
+        page_url = urljoin(page_url, link)
+        page_query = None
+
+    raise CollectorError(f"Meraki pagination exceeded MERAKI_MAX_PAGES={config.max_pages} for {base_url}")
 
 
 def mock_payloads() -> dict[str, Any]:
@@ -359,9 +483,9 @@ def build_metrics(payloads: dict[str, Any], org_id: str, timestamp_ns: int | Non
             client_timestamp = timestamp_ns
             if isinstance(last_seen, (int, float)):
                 client_timestamp = int(float(last_seen) * 1_000_000_000)
-                fields["connected_at"] = datetime.fromtimestamp(
-                    float(last_seen), tz=timezone.utc
-                ).isoformat().replace("+00:00", "Z")
+                connected = datetime.fromtimestamp(float(last_seen), tz=timezone.utc)
+                fields["connected_at"] = connected.isoformat().replace("+00:00", "Z")
+                fields["last_connected"] = format_last_connected(last_seen)
             signal = signal_by_key.get(f"{network_id}|{mac.lower()}") or signal_by_mac.get(mac.lower(), {})
             if signal.get("rssi") is not None:
                 fields["signal_strength_dbm"] = float(signal["rssi"])
@@ -380,23 +504,39 @@ def build_metrics(payloads: dict[str, Any], org_id: str, timestamp_ns: int | Non
     return result
 
 
-def send_to_kentik(config: Config, body: str, post: Callable[..., Any] | None = None) -> None:
+def send_to_kentik(config: Config, body: str, post: Callable[..., Any] | None = None, sleeper: Callable[[float], None] | None = None) -> None:
     if not config.kentik_ingest_url:
         raise CollectorError("KENTIK_INGEST_URL is required when not using --dry-run")
     post = post or urlopen
+    sleeper = sleeper or time.sleep
     request = Request(config.kentik_ingest_url, data=body.encode("utf-8"), headers={
         "Content-Type": "application/influx",
         "X-CH-Auth-Email": config.kentik_email,
         "X-CH-Auth-API-Token": config.kentik_api_token,
     }, method="POST")
-    try:
-        with post(request, timeout=config.timeout_seconds) as response:
-            if response.status >= 300:
-                raise CollectorError(f"Kentik ingest returned HTTP {response.status}")
-    except HTTPError as exc:
-        raise CollectorError(f"Kentik ingest returned HTTP {exc.code}") from exc
-    except URLError as exc:
-        raise CollectorError(f"Unable to reach Kentik ingest endpoint: {exc.reason}") from exc
+
+    for attempt in range(config.max_retries + 1):
+        try:
+            with post(request, timeout=config.timeout_seconds) as response:
+                status = getattr(response, "status", 200)
+                if status >= 300:
+                    if status in RETRYABLE_HTTP_STATUS and attempt < config.max_retries:
+                        sleeper(retry_delay(attempt, config.retry_backoff_seconds, getattr(response, "headers", None)))
+                        continue
+                    raise CollectorError(f"Kentik ingest returned HTTP {status}")
+                return
+        except HTTPError as exc:
+            if exc.code in RETRYABLE_HTTP_STATUS and attempt < config.max_retries:
+                sleeper(retry_delay(attempt, config.retry_backoff_seconds, exc.headers))
+                continue
+            raise CollectorError(f"Kentik ingest returned HTTP {exc.code}") from exc
+        except URLError as exc:
+            if attempt < config.max_retries:
+                sleeper(config.retry_backoff_seconds * (2 ** attempt))
+                continue
+            raise CollectorError(f"Unable to reach Kentik ingest endpoint: {exc.reason}") from exc
+
+    raise CollectorError("Kentik ingest retries exhausted")
 
 
 def optional_fetch(config: Config, path: str, query: dict[str, Any] | None = None) -> Any:

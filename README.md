@@ -2,13 +2,12 @@
 
 This package collects Meraki Dashboard API telemetry and emits Influx line protocol for Kentik. The archive does **not** include `.env` or credentials.
 
-## Clone and first install
-
-Clone this repository on the Linux host that will run the collector:
+## First install
 
 ```bash
-git clone https://github.com/NeoMatrix1217/Meraki-Kentik.git
-cd Meraki-Kentik
+cd ~/Downloads
+tar -xzf meraki-kentik-poc.tar.gz
+cd meraki-kentik-poc
 cp .env.example .env
 chmod 600 .env
 nano .env
@@ -63,7 +62,9 @@ python3 collector.py --mode real --dry-run
 
 `--mode real --dry-run` reads Meraki credentials and queries Meraki, but does not send anything to Kentik.
 
-The wireless client lookback defaults to 24 hours through `MERAKI_CLIENT_TIMESPAN=86400`; adjust it in `.env` if a shorter or longer view is needed.
+The wireless client lookback defaults to 24 hours through `MERAKI_CLIENT_TIMESPAN=86400`; adjust it in `.env` if a shorter or longer view is needed. Client rows include `last_connected` as a Dashboard-style readable UTC value such as `10/14/2026 12:00:00 PM UTC`, while retaining the existing `connected_at` ISO-8601 field and point timestamp.
+
+For larger organizations, the collector follows Meraki `Link` headers to retrieve additional pages. Transient Meraki and Kentik failures are retried with exponential backoff, and HTTP 429 responses honor `Retry-After`. Tune `HTTP_MAX_RETRIES`, `HTTP_RETRY_BACKOFF_SECONDS`, and `MERAKI_MAX_PAGES` in `.env` if needed.
 
 ## Measurements
 

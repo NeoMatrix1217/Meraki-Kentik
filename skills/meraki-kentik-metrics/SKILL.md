@@ -21,10 +21,14 @@ The bundled collector emits these starter measurements:
 - `meraki_uplink_quality`: loss percentage and latency in milliseconds.
 - `meraki_uplink_status`: uplink state and numeric status code.
 - `meraki_wireless_connection`: association, authentication, DHCP, DNS, and successful connection counts.
-- `meraki_wireless_client`: client name, IPv4/IPv6, SSID, MAC, connected state/time, signal strength/RSSI, SNR, PHY data rate in Kbps and bps, throughput in Kbps, and sent/received usage in raw KB plus MB display metrics.
+- `meraki_wireless_client`: client name, IPv4/IPv6, SSID, MAC, connected state, Dashboard-style readable `last_connected` UTC date/time, backward-compatible ISO-8601 `connected_at`, signal strength/RSSI, SNR, PHY data rate in Kbps and bps, throughput in Kbps, and sent/received usage in raw KB plus MB display metrics.
 - `meraki_wireless_access_point`: AP name, management IP, AP MAC, BSSID, SSID, radio/band, channel, channel width, current endpoint count, AP bandwidth usage in total/sent/received Kbps, and total/Wi-Fi/non-Wi-Fi channel utilization percentages.
 
-The client measurement uses client identity attributes as dimensions for SolarWinds-style per-client views. Review cardinality before scaling beyond a small proof of concept; set `MAX_WIRELESS_CLIENTS` to cap per-client data-rate calls. The AP measurement uses AP, BSSID, SSID, and radio identity attributes as dimensions; set `MAX_WIRELESS_ACCESS_POINTS` to cap AP history calls.
+The client measurement uses client identity attributes as dimensions for SolarWinds-style per-client views. Use `last_connected` for a human-readable Connected column; it is formatted in UTC to keep dashboards consistent across hosts, while the point timestamp remains the numeric `lastSeen` epoch and `connected_at` remains available for existing queries. Review cardinality before scaling beyond a small proof of concept; set `MAX_WIRELESS_CLIENTS` to cap per-client data-rate calls. The AP measurement uses AP, BSSID, SSID, and radio identity attributes as dimensions; set `MAX_WIRELESS_ACCESS_POINTS` to cap AP history calls.
+
+## Reliability and scale controls
+
+The collector follows Meraki `Link` headers for paginated responses and merges list or `items` pages up to `MERAKI_MAX_PAGES` (default 100). Transient Meraki and Kentik failures are retried up to `HTTP_MAX_RETRIES` (default 3) with exponential backoff from `HTTP_RETRY_BACKOFF_SECONDS` (default 1 second); HTTP 429 responses honor `Retry-After`. Keep the page limit bounded and tune retry settings only after checking API rate-limit behavior.
 
 ## Workflow
 
